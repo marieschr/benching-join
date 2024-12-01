@@ -1,0 +1,383 @@
+/* eslint-disable @typescript-eslint/no-unsafe-member-access */
+/* eslint-disable @typescript-eslint/no-unsafe-call */
+import express, { type Request, type Response } from 'express';
+import bodyParser from 'body-parser';
+import { MockFile, RealFile } from './mockfile.mjs';
+import { Database } from './simpledbms-dummy.mjs';
+import { type ParsedQs } from 'qs';
+
+const app = express();
+app.use(bodyParser.json());
+
+//
+// ================================= REST API =================================
+//
+
+// GET endpoint to retrieve all collections
+app.get('/', async (_req: Request, _res: Response) => {});
+
+// GET endpoint to retrieve all documents of a collection
+app.get('/:collection', (req: Request, res: Response) => {
+  const collection = req.params['collection'];
+  const collections = ['leuven']; // = db.getCollections();
+
+  if (!collections.includes(collection)) {
+    res.status(404).json({ message: 'Collection not found' });
+    return;
+  }
+
+  let documents: string[] = [];
+  documents = db.getAllDocuments(collection) as string[]; // use of cursor instead of getAllDocuments?
+
+  /*
+  const cursor = db.createCursor(collection, "field");
+  let doc = cursor.retrieveDocument();
+  while( doc != null) { 
+    // does cursor.retrieveDocument() return null when at end of collection?
+    documents.push(doc);
+    cursor.next();
+    doc = cursor.retrieveDocument();
+  }
+  */
+
+  if (documents === undefined) {
+    // undefined -> null ?
+    res.status(404).json({ message: 'Collection not found' });
+    return;
+  }
+
+  res.status(200).json(documents);
+});
+
+// POST endpoint to add a new document
+app.post('/:collection', (req: Request, res: Response) => {
+  const collection: string = req.params['collection'];
+  const document: string = req.body as string ; // Assume just one document in body
+
+  db.addDocument(document, collection);
+  res.status(201).json({ message: 'Documents added', documents: document });
+});
+
+// PUT endpoint to update a document
+app.put('/:collection/:id', (req: Request, res: Response) => {
+  const collection: string = req.params['collection'];
+  const id: string = req.params['id'];
+  const document: string = req.body as string; // string -> Document
+
+  // TODO but no update function available yet
+  // db.updateDocument(req.body, collection, id);
+  res.status(200).json({ message: 'Documents updated' }); //return updated documents?
+});
+
+// DELETE endpoint to delete a document
+app.delete('/:collection/:id', (req: Request, res: Response) => {
+  const collection: string = req.params['collection'];
+  const id: string = req.params['id'];
+
+  db.deleteDocument(id, collection);
+  res.status(200).json({ message: 'Document deleted' });
+});
+
+// JOIN endpoint
+app.get('/join', (req: Request, res: Response) => {
+  const collectionA = String(req.query['collectionA']);
+  const collectionB = String(req.query['collectionB']);
+  const keyA = String(req.query['keyA']);
+  const keyB = String(req.query['keyB']);
+
+  // Retrieve collections based on provided names
+  const dataA = db.getAllDocuments(collectionA) as CollectionItem[];
+  const dataB = db.getAllDocuments(collectionB) as CollectionItem[];
+
+  // Ensure collections and keys are valid
+  if (!dataA || !dataB || !keyA || !keyB) {
+    res.status(400).json({ message: 'Invalid parameters' });
+    return;
+  }
+
+  // Perform the join
+  const result = joinCollections(dataA, dataB, keyA, keyB);
+  res.json(result);
+});
+
+// GROUPING endpoint
+app.get('/group', (req: Request, res: Response) => {
+  const collection = String(req.query['collection']);
+  const key = req.query['key'] as string;
+
+  // Validate input
+  if (!collection || !key) {
+    res.status(400).json({ message: 'Missing required query parameters: collection, key' });
+    return;
+  }
+
+  // Retrieve the requested collection
+  const documents = db.getAllDocuments(collection) as CollectionItem[];
+
+  // Perform grouping
+  const result = groupBy(documents, key);
+  res.json(result);
+});
+
+// FILTER endpoint
+app.get('/:collection/filter', (req: Request, res: Response) => {
+  const collection: string = req.params['collection'];
+
+  // Input validation
+  if (!req.body) {
+    res.status(400).json({ message: 'request body is required' });
+    return;
+  }
+
+  const body = req.body as FilterRequestBody;
+
+  if (!body.filterOnKey) {
+    res.status(400).json({ message: 'filterOnKey is required' });
+    return;
+  }
+  if (!body.filterValues) {
+    res.status(400).json({ message: 'filterValues is required' });
+    return;
+  }
+  if (!Array.isArray(body.filterValues)) {
+    res.status(400).json({ message: 'filterValues must be array' });
+    return;
+  }
+  if (!(0 < body.filterValues.length && body.filterValues.length <= 2)) {
+    res.status(400).json({ message: 'filterValues must contain one or two elements' });
+    return;
+  }
+  if (!collectionExists(collection)) {
+    res.status(404).json({ message: 'Collection not found' });
+    return;
+  }
+
+  // filter
+
+  const filterKey = body.filterOnKey;
+  const values = body.filterValues;
+  const documents = filter(collection, filterKey, values);
+  res.json(documents);
+});
+
+// SORT endpoint
+app.get('/:collection/sort', (req: Request, res: Response) => {
+  const collection = req.params['collection'];
+
+  if (!req.body) {
+    res.status(400).json({ message: 'request body is required' });
+    return;
+  }
+
+  const body = req.body as SortRequestBody;
+
+  if (!body.sortOnKey) {
+    res.status(400).json({ message: 'sortOnKey is required' });
+    return;
+  }
+  if (!collectionExists(collection)) {
+    res.status(404).json({ message: 'Collection not found' });
+    return;
+  }
+
+  // sort
+  const sortKey = body.sortOnKey;
+  const documents = sort(collection, sortKey);
+  res.json(documents);
+});
+
+//PAGINATION endpoint
+app.get('/:collection/page', (req: Request, res: Response) => {
+  const collection = req.params['collection'];
+  const amount = Number(req.query['amount']);
+  const start = Number(req.query['start']);
+  const result = [];
+  const documents = db.getAllDocuments(collection) as string[];
+
+  // Validate input
+  if (!amount || !start) {
+    res.status(400).json({ message: 'Missing required query parameters: amount, start' });
+    return;
+  }
+  if (amount < 0 || start < 0) {
+    res.status(400).json({ message: 'Amount or start cannot be negative' });
+    return;
+  }
+  if (documents.length < amount || documents.length < start + amount) {
+    res.status(400).json({ message: 'The range needs to be within the database' });
+    return;
+  }
+
+  // pagination
+  for (let counter = start; counter < start + amount; counter++) {
+    result.push(documents[counter]);
+  }
+  res.json(result);
+});
+
+//
+// ================================= HELPER FUNCTIONS =================================
+//
+
+// Define types for the collections
+type CollectionItem = { [key: string]: unknown };
+
+type Collections = CollectionItem[];
+
+// Join helper function to combine collections based on keys
+function joinCollections(
+  collectionA: Collections,
+  collectionB: Collections,
+  keyA: string,
+  keyB: string
+): (CollectionItem & { related: CollectionItem | null })[] {
+  return collectionA.map((itemA: CollectionItem) => {
+    const relatedItemB = collectionB.find(
+      (itemB: CollectionItem) => itemA[keyA] === itemB[keyB]
+    );
+    return {
+      ...itemA,
+      related: relatedItemB || null, // attach related item or null if no match
+    };
+  });
+}
+
+function groupBy<T>(
+  collection: T[],
+  key: keyof T
+): Record<string, T[]> {
+  return collection.reduce((result: Record<string, T[]>, item) => {
+    const groupKey = item[key] as string;
+
+    // Use 'const' for 'keyString' as it is not reassigned
+    const keyString = String(groupKey);
+
+    if (!result[keyString]) {
+      result[keyString] = [];
+    }
+
+    result[keyString].push(item);
+    return result;
+  }, {});
+}
+
+
+
+
+
+
+
+
+// filter helper function
+const filter = (collection: string, field: string, val: unknown[]) => {
+  const result = [];
+  const documents: string[] = db.getAllDocuments(collection) as string[];
+
+  const cursor = db.createCursor(collection, field) as string[];
+
+  if (val.length === 1) {
+    const filterValue = val[0];
+
+    /*
+    let doc = cursor.retrieveDocument();
+    while (doc !== null) {
+      // does cursor.retrieveDocument() return null when at end of collection?
+
+      const documentValue = document[field]; // how to access field of document
+      if (
+        (typeof documentValue === 'number' && typeof filterValue === 'number') ||
+        (typeof documentValue === 'string' && typeof filterValue === 'string') ||
+        (typeof documentValue === 'boolean' && typeof filterValue === 'boolean')
+      ) {
+        // Equality check
+        if (filterValue === documentValue) {
+          result.push(doc);
+        }
+      }
+
+      cursor.next();
+      doc = cursor.retrieveDocument();
+    }
+    */
+
+    for (const document of documents) {
+      const documentValue = document[field]; // how to access field of document?-> kunnen eventueel helperfunctie maken?
+      if (
+        (typeof documentValue === 'number' && typeof filterValue === 'number') ||
+        (typeof documentValue === 'string' && typeof filterValue === 'string') ||
+        (typeof documentValue === 'boolean' && typeof filterValue === 'boolean')
+      ) {
+        // Equality check
+        if (filterValue === documentValue) {
+          result.push(document);
+        }
+      }
+    }
+  } else if (val.length === 2) {
+    const lowerValue = val[0];
+    const upperValue = val[1];
+    for (const document of documents) {
+      const documentValue = document[field]; // how to access field of document?-> kunnen eventueel helperfunctie maken?
+      if (typeof documentValue === 'number' && typeof lowerValue === 'number' && typeof upperValue === 'number') {
+        // Range check
+        if (lowerValue <= documentValue && documentValue <= upperValue) {
+          result.push(document);
+        }
+      }
+    }
+  } else {
+    return null;
+  }
+  return result;
+};
+
+interface FilterRequestBody {
+  filterOnKey?: string;
+  filterValues?: string[];
+}
+
+// sort helper function
+const sort = (collection: string, sortKey: string, descending = false) => {
+  const documents: string[] = db.getAllDocuments(collection) as string[];
+
+  // If there are no documents or an invalid key is provided, return an empty array
+  if (
+    !documents ||
+    !Array.isArray(documents) ||
+    (typeof documents[0][sortKey] !== 'number' &&
+      typeof documents[0][sortKey] !== 'string')
+  ) {
+    return [];
+  }
+
+  // Sort the documents by the specified sortKey
+  return documents.sort((a, b) => {
+    // Determine comparison based on ascending or descending order
+    if (a[sortKey] > b[sortKey]) return descending ? -1 : 1;
+    if (a[sortKey] < b[sortKey]) return descending ? 1 : -1;
+    return 0; // equal values
+  });
+};
+
+
+interface SortRequestBody {
+  sortOnKey?: string;
+}
+
+function collectionExists(key: string): boolean {
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-return
+  return db.getAllCollections().includes(key);
+}
+
+//
+// ================================= STARTING SERVER =================================
+//
+
+// Initiate database
+const file = new MockFile(512);
+const db =  await Database.create(file);
+
+// Start server
+app.listen(3000, () => {
+  console.log('simpledbmsd server running on http://localhost:3000');
+}); 
